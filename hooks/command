@@ -40,10 +40,17 @@ target_container=${BUILDKITE_PLUGIN_ECS_DEPLOY_TARGET_CONTAINER_NAME:-""}
 target_port=${BUILDKITE_PLUGIN_ECS_DEPLOY_TARGET_CONTAINER_PORT:-""}
 execution_role=${BUILDKITE_PLUGIN_ECS_DEPLOY_EXECUTION_ROLE:-""}
 region=${BUILDKITE_PLUGIN_ECS_DEPLOY_REGION:-""}
+network_mode=${BUILDKITE_PLUGIN_ECS_DEPLOY_NETWORK_MODE:-"none"}
+task_cpu=${BUILDKITE_PLUGIN_ECS_DEPLOY_TASK_CPU:-""}
+task_memory=${BUILDKITE_PLUGIN_ECS_DEPLOY_TASK_MEMORY:-""}
+task_requires_compatibilities=${BUILDKITE_PLUGIN_ECS_DEPLOY_TASK_REQUIRES_COMPATIBILITIES:-""}
+service_launch_type=${BUILDKITE_PLUGIN_ECS_DEPLOY_SERVICE_LAUNCH_TYPE:-""}
+service_subnets=${BUILDKITE_PLUGIN_ECS_DEPLOY_SERVICE_SUBNETS:-""}
+service_security_groups=${BUILDKITE_PLUGIN_ECS_DEPLOY_SERVICE_SECURITY_GROUPS:-""}
+service_health_check_grace_period_seconds=${BUILDKITE_PLUGIN_ECS_DEPLOY_SERVICE_HEALTH_CHECK_GRACE_PERIOD_SECONDS:-"0"}
 
 if [[ $region != "" ]]; then
-  # shellcheck disable=SC2034 # Used by the aws cli
-  AWS_DEFAULT_REGION=${region}
+    AWS_DEFAULT_REGION=${region}
 fi
 
 # Resolve any runtime environment variables it has
@@ -56,7 +63,7 @@ min_max_percent=(${deployment_config//\// })
 min_deploy_perc=${min_max_percent[0]}
 max_deploy_perc=${min_max_percent[1]}
 
-if [[ $(jq '. | keys |first' "$task_definition") != "0" ]]; then
+if [[ $(jq '. | keys |first' $task_definition) != "0" ]]; then
     echo "^^^"
     echo "Invalid Task Definition"
     echo 'JSON definition should be in the format of [{"image": "..."}]'
@@ -76,13 +83,50 @@ function create_service() {
     if [[ $service_defined -eq 0 ]]; then
         echo "--- :ecs: Creating a Service $service_name in cluster $cluster_name"
         # shellcheck disable=SC2086
-        aws ecs create-service \
-        --cluster "$cluster_name" \
-        --service-name "$service_name" \
-        --task-definition "$task_definition" \
-        --desired-count "$desired_count" \
-        --deployment-configuration "maximumPercent=${max_deploy_perc},minimumHealthyPercent=${min_deploy_perc}" \
-        $target_group_arguments
+        if [[ $service_launch_type == "FARGATE" ]]; then
+          if [[ -z $target_group ]]; then
+            aws ecs create-service \
+            --cluster "$cluster_name" \
+            --service-name "$service_name" \
+            --task-definition "$task_definition" \
+            --desired-count "$desired_count" \
+            --launch-type "FARGATE" \
+            --network-configuration "awsvpcConfiguration={subnets=[${service_subnets}],securityGroups=[${service_security_groups}],assignPublicIp=ENABLED}" \
+            --deployment-configuration "maximumPercent=${max_deploy_perc},minimumHealthyPercent=${min_deploy_perc}"
+          else
+            aws ecs create-service \
+            --cluster "$cluster_name" \
+            --service-name "$service_name" \
+            --task-definition "$task_definition" \
+            --desired-count "$desired_count" \
+            --launch-type "FARGATE" \
+            --health-check-grace-period-seconds "$service_health_check_grace_period_seconds" \
+            --network-configuration "awsvpcConfiguration={subnets=[${service_subnets}],securityGroups=[${service_security_groups}],assignPublicIp=ENABLED}" \
+            --deployment-configuration "maximumPercent=${max_deploy_perc},minimumHealthyPercent=${min_deploy_perc}" \
+            $target_group_arguments
+          fi
+        else
+          if [[ "$network_mode" == "awsvpc" ]]; then
+            aws ecs create-service \
+            --cluster "$cluster_name" \
+            --service-name "$service_name" \
+            --task-definition "$task_definition" \
+            --desired-count "$desired_count" \
+            --launch-type "EC2" \
+            --deployment-configuration "maximumPercent=${max_deploy_perc},minimumHealthyPercent=${min_deploy_perc}" \
+            --network-configuration "awsvpcConfiguration={subnets=[${service_subnets}],securityGroups=[${service_security_groups}],assignPublicIp=DISABLED}" \
+            $target_group_arguments
+          else
+            aws ecs create-service \
+            --cluster "$cluster_name" \
+            --service-name "$service_name" \
+            --task-definition "$task_definition" \
+            --desired-count "$desired_count" \
+            --launch-type "EC2" \
+            --deployment-configuration "maximumPercent=${max_deploy_perc},minimumHealthyPercent=${min_deploy_perc}" \
+            $target_group_arguments
+          fi
+        fi
     fi
 }
 
@@ -122,7 +166,11 @@ done
 echo "--- :ecs: Registering new task definition for ${task_family}"
 register_command="aws ecs register-task-definition \
     --family ${task_family} \
-    --container-definitions '$container_definitions_json'"
+    --container-definitions '$container_definitions_json' \
+    --network-mode ${network_mode} \
+    --cpu ${task_cpu} \
+    --memory ${task_memory} \
+    --requires-compatibilities ${task_requires_compatibilities}"
 
 if [[ -n "${task_role_arn}" ]]; then
     register_command+=" --task-role-arn ${task_role_arn}"
@@ -178,6 +226,7 @@ echo "--- :ecs: Updating service for ${service_name}"
 aws ecs update-service \
   --cluster "${cluster}" \
   --service "${service_name}" \
+  --desired-count "${desired_count}" \
   --task-definition "${task_family}:${task_revision}"
 
 ## Now we wait till it's stable
